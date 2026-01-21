@@ -22,7 +22,11 @@ import static com.google.common.collect.ImmutableMap.toImmutableMap;
 
 import com.google.adk.Telemetry;
 import com.google.adk.agents.ActiveStreamingTool;
+import com.google.adk.agents.Callbacks.AfterToolCallback;
+import com.google.adk.agents.Callbacks.BeforeToolCallback;
+import com.google.adk.agents.Callbacks.OnToolErrorCallback;
 import com.google.adk.agents.InvocationContext;
+import com.google.adk.agents.LlmAgent;
 import com.google.adk.agents.RunConfig.ToolExecutionMode;
 import com.google.adk.events.Event;
 import com.google.adk.events.EventActions;
@@ -384,9 +388,7 @@ public final class Functions {
         .defaultIfEmpty(Optional.empty())
         .onErrorResumeNext(
             t ->
-                invocationContext
-                    .combinedPlugin()
-                    .onToolErrorCallback(tool, functionArgs, toolContext, t)
+                handleOnToolErrorCallback(invocationContext, tool, functionArgs, toolContext, t)
                     .map(isLive ? Optional::ofNullable : Optional::of)
                     .switchIfEmpty(Single.error(t)))
         .flatMapMaybe(
@@ -454,7 +456,70 @@ public final class Functions {
       BaseTool tool,
       Map<String, Object> functionArgs,
       ToolContext toolContext) {
-    return invocationContext.combinedPlugin().beforeToolCallback(tool, functionArgs, toolContext);
+    if (invocationContext.agent() instanceof LlmAgent) {
+      LlmAgent agent = (LlmAgent) invocationContext.agent();
+
+      Maybe<Map<String, Object>> pluginResult =
+          invocationContext.pluginManager().beforeToolCallback(tool, functionArgs, toolContext);
+
+      List<? extends BeforeToolCallback> callbacks = agent.canonicalBeforeToolCallbacks();
+      if (callbacks.isEmpty()) {
+        return pluginResult;
+      }
+
+      Maybe<Map<String, Object>> callbackResult =
+          Maybe.defer(
+              () ->
+                  Flowable.fromIterable(callbacks)
+                      .concatMapMaybe(
+                          callback ->
+                              callback.call(invocationContext, tool, functionArgs, toolContext))
+                      .firstElement());
+
+      return pluginResult.switchIfEmpty(callbackResult);
+    }
+    return Maybe.empty();
+  }
+
+  /**
+   * Invokes {@link OnToolErrorCallback}s when a tool call fails. If any returns a response, it's
+   * used instead of the error.
+   *
+   * @return A {@link Maybe} with the override result.
+   */
+  private static Maybe<Map<String, Object>> handleOnToolErrorCallback(
+      InvocationContext invocationContext,
+      BaseTool tool,
+      Map<String, Object> functionArgs,
+      ToolContext toolContext,
+      Throwable throwable) {
+    Exception ex = throwable instanceof Exception exception ? exception : new Exception(throwable);
+
+    Maybe<Map<String, Object>> pluginResult =
+        invocationContext
+            .pluginManager()
+            .onToolErrorCallback(tool, functionArgs, toolContext, throwable);
+
+    if (invocationContext.agent() instanceof LlmAgent) {
+      LlmAgent agent = (LlmAgent) invocationContext.agent();
+
+      List<? extends OnToolErrorCallback> callbacks = agent.canonicalOnToolErrorCallbacks();
+      if (callbacks.isEmpty()) {
+        return pluginResult;
+      }
+
+      Maybe<Map<String, Object>> callbackResult =
+          Maybe.defer(
+              () ->
+                  Flowable.fromIterable(callbacks)
+                      .concatMapMaybe(
+                          callback ->
+                              callback.call(invocationContext, tool, functionArgs, toolContext, ex))
+                      .firstElement());
+
+      return pluginResult.switchIfEmpty(callbackResult);
+    }
+    return pluginResult;
   }
 
   private static Maybe<Map<String, Object>> maybeInvokeAfterToolCall(
@@ -463,9 +528,36 @@ public final class Functions {
       Map<String, Object> functionArgs,
       ToolContext toolContext,
       Map<String, Object> functionResult) {
-    return invocationContext
-        .combinedPlugin()
-        .afterToolCallback(tool, functionArgs, toolContext, functionResult);
+    if (invocationContext.agent() instanceof LlmAgent) {
+      LlmAgent agent = (LlmAgent) invocationContext.agent();
+
+      Maybe<Map<String, Object>> pluginResult =
+          invocationContext
+              .pluginManager()
+              .afterToolCallback(tool, functionArgs, toolContext, functionResult);
+
+      List<? extends AfterToolCallback> callbacks = agent.canonicalAfterToolCallbacks();
+      if (callbacks.isEmpty()) {
+        return pluginResult;
+      }
+
+      Maybe<Map<String, Object>> callbackResult =
+          Maybe.defer(
+              () ->
+                  Flowable.fromIterable(callbacks)
+                      .concatMapMaybe(
+                          callback ->
+                              callback.call(
+                                  invocationContext,
+                                  tool,
+                                  functionArgs,
+                                  toolContext,
+                                  functionResult))
+                      .firstElement());
+
+      return pluginResult.switchIfEmpty(callbackResult);
+    }
+    return Maybe.empty();
   }
 
   private static Maybe<Map<String, Object>> callTool(

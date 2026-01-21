@@ -22,6 +22,7 @@ import com.google.adk.agents.BaseAgent;
 import com.google.adk.agents.CallbackContext;
 import com.google.adk.agents.Callbacks.AfterModelCallback;
 import com.google.adk.agents.Callbacks.BeforeModelCallback;
+import com.google.adk.agents.Callbacks.OnModelErrorCallback;
 import com.google.adk.agents.InvocationContext;
 import com.google.adk.agents.LiveRequest;
 import com.google.adk.agents.LlmAgent;
@@ -198,12 +199,10 @@ public abstract class BaseLlmFlow implements BaseFlow {
                                   context.runConfig().streamingMode() == StreamingMode.SSE)
                               .onErrorResumeNext(
                                   exception ->
-                                      context
-                                          .combinedPlugin()
-                                          .onModelErrorCallback(
-                                              new CallbackContext(
-                                                  context, eventForCallbackUsage.actions()),
+                                      handleOnModelErrorCallback(
+                                              context,
                                               llmRequestBuilder,
+                                              eventForCallbackUsage,
                                               exception)
                                           .switchIfEmpty(Single.error(exception))
                                           .toFlowable())
@@ -243,11 +242,64 @@ public abstract class BaseLlmFlow implements BaseFlow {
     Event callbackEvent = modelResponseEvent.toBuilder().build();
     CallbackContext callbackContext = new CallbackContext(context, callbackEvent.actions());
 
-    return context
-        .combinedPlugin()
-        .beforeModelCallback(callbackContext, llmRequestBuilder)
+    Maybe<LlmResponse> pluginResult =
+        context.pluginManager().beforeModelCallback(callbackContext, llmRequestBuilder);
+
+    LlmAgent agent = (LlmAgent) context.agent();
+
+    List<? extends BeforeModelCallback> callbacks = agent.canonicalBeforeModelCallbacks();
+    if (callbacks.isEmpty()) {
+      return pluginResult.map(Optional::of).defaultIfEmpty(Optional.empty());
+    }
+
+    Maybe<LlmResponse> callbackResult =
+        Maybe.defer(
+            () ->
+                Flowable.fromIterable(callbacks)
+                    .concatMapMaybe(callback -> callback.call(callbackContext, llmRequestBuilder))
+                    .firstElement());
+
+    return pluginResult
+        .switchIfEmpty(callbackResult)
         .map(Optional::of)
         .defaultIfEmpty(Optional.empty());
+  }
+
+  /**
+   * Invokes {@link OnModelErrorCallback}s when an LLM call fails. If any returns a response, it's
+   * used instead of the error.
+   *
+   * @return A {@link Maybe} with the override {@link LlmResponse}.
+   */
+  private Maybe<LlmResponse> handleOnModelErrorCallback(
+      InvocationContext context,
+      LlmRequest.Builder llmRequestBuilder,
+      Event modelResponseEvent,
+      Throwable throwable) {
+    Event callbackEvent = modelResponseEvent.toBuilder().build();
+    CallbackContext callbackContext = new CallbackContext(context, callbackEvent.actions());
+    Exception ex = throwable instanceof Exception e ? e : new Exception(throwable);
+
+    Maybe<LlmResponse> pluginResult =
+        context.pluginManager().onModelErrorCallback(callbackContext, llmRequestBuilder, throwable);
+
+    LlmAgent agent = (LlmAgent) context.agent();
+    List<? extends OnModelErrorCallback> callbacks = agent.canonicalOnModelErrorCallbacks();
+
+    if (callbacks.isEmpty()) {
+      return pluginResult;
+    }
+
+    Maybe<LlmResponse> callbackResult =
+        Maybe.defer(
+            () -> {
+              LlmRequest llmRequest = llmRequestBuilder.build();
+              return Flowable.fromIterable(callbacks)
+                  .concatMapMaybe(callback -> callback.call(callbackContext, llmRequest, ex))
+                  .firstElement();
+            });
+
+    return pluginResult.switchIfEmpty(callbackResult);
   }
 
   /**
@@ -261,10 +313,24 @@ public abstract class BaseLlmFlow implements BaseFlow {
     Event callbackEvent = modelResponseEvent.toBuilder().build();
     CallbackContext callbackContext = new CallbackContext(context, callbackEvent.actions());
 
-    return context
-        .combinedPlugin()
-        .afterModelCallback(callbackContext, llmResponse)
-        .defaultIfEmpty(llmResponse);
+    Maybe<LlmResponse> pluginResult =
+        context.pluginManager().afterModelCallback(callbackContext, llmResponse);
+
+    LlmAgent agent = (LlmAgent) context.agent();
+    List<? extends AfterModelCallback> callbacks = agent.canonicalAfterModelCallbacks();
+
+    if (callbacks.isEmpty()) {
+      return pluginResult.defaultIfEmpty(llmResponse);
+    }
+
+    Maybe<LlmResponse> callbackResult =
+        Maybe.defer(
+            () ->
+                Flowable.fromIterable(callbacks)
+                    .concatMapMaybe(callback -> callback.call(callbackContext, llmResponse))
+                    .firstElement());
+
+    return pluginResult.switchIfEmpty(callbackResult).defaultIfEmpty(llmResponse);
   }
 
   /**
